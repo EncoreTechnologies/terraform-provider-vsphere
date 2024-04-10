@@ -59,6 +59,11 @@ var sharesLevelAllowedValues = []string{
 	string(types.SharesLevelCustom),
 }
 
+type dvswitchExpandConfig struct {
+	IsUplinksAdded   bool
+	IsUplinksRemoved bool
+}
+
 // schemaVMwareDVSConfigSpec returns schema items for resources that need to work
 // with a VMwareDVSConfigSpec.
 func schemaVMwareDVSConfigSpec() map[string]*schema.Schema {
@@ -303,7 +308,9 @@ func expandDistributedVirtualSwitchHostMemberConfigSpec(d map[string]interface{}
 	}
 
 	var pnSpecs []types.DistributedVirtualSwitchHostMemberPnicSpec
+
 	nics := structure.SliceInterfacesToStrings(d["devices"].([]interface{}))
+
 	for _, nic := range nics {
 		pnSpec := types.DistributedVirtualSwitchHostMemberPnicSpec{
 			PnicDevice: nic,
@@ -328,7 +335,6 @@ func expandDistributedVirtualSwitchHostMemberConfigSpec(d map[string]interface{}
 // This is the flatten counterpart to
 // expandDistributedVirtualSwitchHostMemberConfigSpec.
 func flattenDistributedVirtualSwitchHostMember(
-	d *schema.ResourceData,
 	client *govmomi.Client,
 	obj types.DistributedVirtualSwitchHostMember,
 	useHostID bool,
@@ -485,7 +491,7 @@ func flattenSliceOfDistributedVirtualSwitchHostMember(d *schema.ResourceData, cl
 	}
 
 	for _, m := range members {
-		host, err := flattenDistributedVirtualSwitchHostMember(d, client, m, useHostID)
+		host, err := flattenDistributedVirtualSwitchHostMember(client, m, useHostID)
 		if err != nil {
 			return fmt.Errorf("error trying to flatten hosts for distributed switch: %s", err)
 		}
@@ -762,9 +768,18 @@ func flattenSliceOfDvsHostInfrastructureTrafficResource(d *schema.ResourceData, 
 
 // expandDVSNameArrayUplinkPortPolicy reads certain ResourceData keys and
 // returns a DVSNameArrayUplinkPortPolicy.
-func expandDVSNameArrayUplinkPortPolicy(d *schema.ResourceData) *types.DVSNameArrayUplinkPortPolicy {
+func expandDVSNameArrayUplinkPortPolicy(d *schema.ResourceData, uplinksRemoved bool) *types.DVSNameArrayUplinkPortPolicy {
+	var uplinks []interface{}
+
+	if uplinksRemoved {
+		o, _ := d.GetChange("uplinks")
+		uplinks = o.([]interface{})
+	} else {
+		uplinks = d.Get("uplinks").([]interface{})
+	}
+
 	obj := &types.DVSNameArrayUplinkPortPolicy{
-		UplinkPortName: structure.SliceInterfacesToStrings(d.Get("uplinks").([]interface{})),
+		UplinkPortName: structure.SliceInterfacesToStrings(uplinks),
 	}
 	if structure.AllFieldsEmpty(obj) {
 		return nil
@@ -780,10 +795,19 @@ func flattenDVSNameArrayUplinkPortPolicy(d *schema.ResourceData, obj *types.DVSN
 
 // expandVMwareDVSConfigSpec reads certain ResourceData keys and
 // returns a VMwareDVSConfigSpec.
-func expandVMwareDVSConfigSpec(d *schema.ResourceData, client *govmomi.Client, dvs *object.VmwareDistributedVirtualSwitch) (*types.VMwareDVSConfigSpec, error) {
-	hosts, err := expandSliceOfDistributedVirtualSwitchHostMemberConfigSpec(d, client)
-	if err != nil {
-		return nil, err
+func expandVMwareDVSConfigSpec(
+	d *schema.ResourceData,
+	client *govmomi.Client,
+	dvs *object.VmwareDistributedVirtualSwitch,
+	cfg dvswitchExpandConfig,
+) (*types.VMwareDVSConfigSpec, error) {
+	var hosts []types.DistributedVirtualSwitchHostMemberConfigSpec
+	var err error
+
+	if !cfg.IsUplinksAdded {
+		if hosts, err = expandSliceOfDistributedVirtualSwitchHostMemberConfigSpec(d, client); err != nil {
+			return nil, fmt.Errorf("error expanding host members for dvswitch: %s", err)
+		}
 	}
 
 	var configVersion string
@@ -815,7 +839,7 @@ func expandVMwareDVSConfigSpec(d *schema.ResourceData, client *govmomi.Client, d
 			SwitchIpAddress:                     d.Get("ipv4_address").(string),
 			InfrastructureTrafficResourceConfig: expandSliceOfDvsHostInfrastructureTrafficResource(d),
 			NetworkResourceControlVersion:       d.Get("network_resource_control_version").(string),
-			UplinkPortPolicy:                    expandDVSNameArrayUplinkPortPolicy(d),
+			UplinkPortPolicy:                    expandDVSNameArrayUplinkPortPolicy(d, cfg.IsUplinksRemoved),
 		},
 		PvlanConfigSpec:             expandSliceOfVMwareDVSPvlanConfigSpec(d),
 		MaxMtu:                      int32(d.Get("max_mtu").(int)),
@@ -894,7 +918,7 @@ func schemaDVSCreateSpec() map[string]*schema.Schema {
 // expandDVSCreateSpec reads certain ResourceData keys and
 // returns a DVSCreateSpec.
 func expandDVSCreateSpec(d *schema.ResourceData, client *govmomi.Client) (types.DVSCreateSpec, error) {
-	spec, err := expandVMwareDVSConfigSpec(d, client, nil)
+	spec, err := expandVMwareDVSConfigSpec(d, client, nil, dvswitchExpandConfig{})
 	if err != nil {
 		return types.DVSCreateSpec{}, err
 	}
