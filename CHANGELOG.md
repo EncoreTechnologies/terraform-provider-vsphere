@@ -1,4 +1,12 @@
 # <!-- markdownlint-disable first-line-h1 no-inline-html -->
+## 3.5.1 (April 10, 2024)
+IMPROVEMENTS:
+* Added ability for clusters to use hostnames for hosts within cluster on top of `host_system_id`
+
+BUG FIXES:
+* Fixed bug in `vsphere_distributed_virtual_switch` resource where if entries were added or removed
+from the `uplinks` attribute, an error was thrown
+
 ## 3.5.0 (March 14, 2024)
 FEATURES:
 * `datasource/vsphere_vnic_list` : Adds ability to query vnics based on host passed
