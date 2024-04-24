@@ -157,7 +157,22 @@ func resourceVSphereComputeCluster() *schema.Resource {
 				MaxItems:      64,
 				Description:   "The managed object IDs of the hosts to put in the cluster.",
 				Elem:          &schema.Schema{Type: schema.TypeString},
-				ConflictsWith: []string{"host_managed"},
+				ConflictsWith: []string{"host_managed", "hostnames", "use_hostnames"},
+			},
+			"use_hostnames": {
+				Type:          schema.TypeBool,
+				Optional:      true,
+				Default:       false,
+				Description:   "Determines whether to use hostnames for connecting hosts to cluster",
+				ConflictsWith: []string{"host_system_ids"},
+			},
+			"hostnames": {
+				Type:          schema.TypeSet,
+				Optional:      true,
+				MaxItems:      64,
+				Description:   "The hostname of the hosts to put in the cluster.",
+				Elem:          &schema.Schema{Type: schema.TypeString},
+				ConflictsWith: []string{"host_managed", "host_system_ids"},
 			},
 			"folder": {
 				Type:        schema.TypeString,
@@ -489,7 +504,7 @@ func resourceVSphereComputeCluster() *schema.Resource {
 				Type:          schema.TypeBool,
 				Optional:      true,
 				Description:   "Must be set if cluster enrollment is managed from host resource.",
-				ConflictsWith: []string{"host_system_ids"},
+				ConflictsWith: []string{"host_system_ids", "hostnames"},
 			},
 			// VSAN
 			"vsan_enabled": {
@@ -746,8 +761,22 @@ func resourceVSphereComputeClusterDelete(d *schema.ResourceData, meta interface{
 }
 
 func resourceVSphereComputeClusterImport(d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
-	p := d.Id()
-	cluster, err := resourceVSphereComputeClusterGetClusterFromPath(meta, p, "")
+	idArr := strings.Split(d.Id(), ":")
+	errMsg := "invalid import for cluster %q.  Format should be <path_to_cluster> or <path_to_cluster>:use_hostnames"
+
+	if len(idArr) > 2 {
+		return nil, fmt.Errorf(errMsg, idArr[0])
+	}
+
+	if len(idArr) == 2 {
+		if idArr[1] != "use_hostnames" {
+			return nil, fmt.Errorf(errMsg, idArr[0])
+		}
+
+		d.Set("use_hostnames", true)
+	}
+
+	cluster, err := resourceVSphereComputeClusterGetClusterFromPath(meta, idArr[0], "")
 	if err != nil {
 		return nil, fmt.Errorf("error loading cluster: %s", err)
 	}
@@ -860,7 +889,13 @@ func resourceVSphereComputeClusterProcessHostUpdate(
 		return err
 	}
 
-	o, n := d.GetChange("host_system_ids")
+	var o, n interface{}
+
+	if d.Get("use_hostnames").(bool) {
+		o, n = d.GetChange("hostnames")
+	} else {
+		o, n = d.GetChange("host_system_ids")
+	}
 
 	newHosts, err := resourceVSphereComputeClusterGetHostSystemObjects(
 		client,
@@ -910,7 +945,7 @@ func resourceVSphereComputeClusterGetHostSystemObjects(client *govmomi.Client, h
 	var hosts []*object.HostSystem
 
 	for _, hsID := range hsIDs {
-		hs, err := hostsystem.FromID(client, hsID)
+		hs, _, err := hostsystem.CheckIfHostnameOrID(client, hsID)
 		if err != nil {
 			return nil, fmt.Errorf("error locating host system ID %q: %s", hsID, err)
 		}
@@ -1247,10 +1282,18 @@ func resourceVSphereComputeClusterDeleteProcessForceRemoveHosts(
 		return err
 	}
 
+	var ids []interface{}
+
+	if d.Get("use_hostnames").(bool) {
+		ids = d.Get("hostnames").(*schema.Set).List()
+	} else {
+		ids = d.Get("host_system_ids").(*schema.Set).List()
+	}
+
 	log.Printf("[DEBUG] %s: Force-evacuating hosts in cluster before removal", resourceVSphereComputeClusterIDString(d))
 	hosts, err := resourceVSphereComputeClusterGetHostSystemObjects(
 		client,
-		structure.SliceInterfacesToStrings(d.Get("host_system_ids").(*schema.Set).List()),
+		structure.SliceInterfacesToStrings(ids),
 	)
 	if err != nil {
 		return err
@@ -1337,10 +1380,26 @@ func resourceVSphereComputeClusterFlattenData(
 
 	if !d.Get("host_managed").(bool) {
 		hostList := []string{}
-		for _, host := range props.Host {
-			hostList = append(hostList, host.Value)
+
+		if d.Get("use_hostnames").(bool) {
+			for _, host := range props.Host {
+				hs, _, err := hostsystem.CheckIfHostnameOrID(client, host.Value)
+				if err != nil {
+					return fmt.Errorf("error retrieving host when setting %q attribute: %s", "hostnames", err)
+				}
+
+				hostList = append(hostList, hs.Name())
+			}
+
+			d.Set("hostnames", hostList)
+		} else {
+			for _, host := range props.Host {
+				hostList = append(hostList, host.Value)
+			}
+
+			d.Set("host_system_ids", hostList)
 		}
-		_ = d.Set("host_system_ids", hostList)
+
 	}
 
 	// VSAN
@@ -2350,6 +2409,7 @@ func resourceVSphereComputeClusterHasClusterConfigChangeExcluded(k string) bool 
 		"name",
 		"datacenter_id",
 		"host_system_ids",
+		"hostnames",
 		"folder",
 		"host_cluster_exit_timeout",
 		"force_evacuate_on_destroy",

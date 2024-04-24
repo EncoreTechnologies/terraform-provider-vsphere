@@ -85,6 +85,43 @@ resource "vsphere_compute_cluster" "compute_cluster" {
 }
 ```
 
+### Using hostnames
+
+```hcl
+variable "datacenter" {
+  default = "dc-01"
+}
+
+variable "hosts" {
+  default = [
+    "esxi01.example.com",
+    "esxi02.example.com",
+    "esxi03.example.com",
+  ]
+}
+
+data "vsphere_datacenter" "datacenter" {
+  name = var.datacenter
+}
+
+data "vsphere_host" "host" {
+  count         = length(var.hosts)
+  name          = var.hosts[count.index]
+  datacenter_id = data.vsphere_datacenter.datacenter.id
+}
+
+resource "vsphere_compute_cluster" "compute_cluster" {
+  name            = "terraform-compute-cluster-test"
+  datacenter_id   = data.vsphere_datacenter.datacenter.id
+  hostnames       = [data.vsphere_host.host.*.hostname]
+
+  drs_enabled          = true
+  drs_automation_level = "fullyAutomated"
+
+  ha_enabled = true
+}
+```
+
 ## Argument Reference
 
 The following arguments are supported:
@@ -120,10 +157,12 @@ The following settings control cluster membership or tune how hosts are managed
 within the cluster itself by Terraform.
 
 * `host_system_ids` - (Optional) The [managed object IDs][docs-about-morefs] of
-  the hosts to put in the cluster. Conflicts with: `host_managed`.
+  the hosts to put in the cluster. Conflicts with: `host_managed`, `hostnames`, `use_hostnames`.
+* `hostnames` - (Optional) The hostnames of the hosts to put in the cluster.  Must also set `use_hostsnames` to use this. Conflicts with: `host_managed`, `host_system_ids`.
+* `use_hostnames` - (Optional) Determines whether to use hostnames for connecting hosts to cluster.  Conflicts with `host_system_ids`
 * `host_managed` - (Optional) Can be set to `true` if compute cluster
   membership will be managed through the `host` resource rather than the
-  `compute_cluster` resource. Conflicts with: `host_system_ids`.
+  `compute_cluster` resource. Conflicts with: `host_system_ids`, `hostnames`.
 * `host_cluster_exit_timeout` - The timeout, in seconds, for each host maintenance
   mode operation when removing hosts from a cluster. Default: `3600` seconds (1 hour).
 * `force_evacuate_on_destroy` - When destroying the resource, setting this to
@@ -142,7 +181,7 @@ the `host_system_ids` attribute.
 #### How Terraform Removes ESXi Hosts from Clusters
 
 You can remove hosts from clusters by adjusting the
-[`host_system_ids`](#host_system_ids) configuration setting and removing the
+[`host_system_ids`](#host_system_ids) or `hostnames` configuration setting and removing the
 hosts in question. Hosts are removed sequentially, by placing them in
 maintenance mode, _moving them_ to the root host folder in vSphere inventory,
 and then taking the host out of maintenance mode. This process, if successful,
@@ -550,6 +589,15 @@ terraform import vsphere_compute_cluster.compute_cluster /dc-01/host/cluster-01
 
 The above would import the cluster named `cluster-01` that is located in
 the `dc-01` datacenter.
+
+An additional option is available if a user wishes to use esxi hostnames instead of host_system_ids
+to add hosts to a cluster by appending `:use_hostnames` to the cluster path on import
+
+```
+terraform import vsphere_compute_cluster.compute_cluster /dc-01/host/cluster-01:use_hostnames
+```
+
+The above will set our `use_hostnames` attribute to `true` and on import will set the `hostnames` attribute
 
 ## vSphere Version Requirements
 
