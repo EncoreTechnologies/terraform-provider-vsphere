@@ -6,13 +6,16 @@ package vsphere
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-provider-vsphere/vsphere/internal/helper/customattribute"
 	"github.com/hashicorp/terraform-provider-vsphere/vsphere/internal/helper/folder"
+	"github.com/hashicorp/terraform-provider-vsphere/vsphere/internal/helper/hostsystem"
 	"github.com/hashicorp/terraform-provider-vsphere/vsphere/internal/helper/structure"
 	"github.com/hashicorp/terraform-provider-vsphere/vsphere/internal/helper/viapi"
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 )
 
@@ -234,13 +237,147 @@ func resourceVSphereDistributedVirtualSwitchUpdate(d *schema.ResourceData, meta 
 		_ = d.Set("config_version", props.Config.(*types.VMwareDVSConfigInfo).ConfigVersion)
 	}
 
-	spec, err := expandVMwareDVSConfigSpec(d, client, dvs)
+	expandCfg := dvswitchExpandConfig{}
+	removedUplinks := []interface{}{}
+
+	if d.HasChange("uplinks") {
+		o, n := d.GetChange("uplinks")
+		oldList := o.([]interface{})
+		newList := n.([]interface{})
+
+		if len(newList) < len(oldList) {
+			expandCfg.IsUplinksRemoved = true
+
+			for _, oLink := range oldList {
+				found := false
+
+				for _, nLink := range newList {
+					if oLink == nLink {
+						found = true
+					}
+				}
+
+				if !found {
+					removedUplinks = append(removedUplinks, oLink)
+				}
+			}
+		} else if len(oldList) < len(newList) {
+			expandCfg.IsUplinksAdded = true
+		}
+	}
+
+	spec, err := expandVMwareDVSConfigSpec(d, client, dvs, expandCfg)
 	if err != nil {
 		return fmt.Errorf("error retrieving config: %s", err)
 	}
 
 	if err := updateDVSConfiguration(dvs, spec); err != nil {
-		return fmt.Errorf("could not update DVS: %s", err)
+		return fmt.Errorf("could not update DVS on first update: %s", err)
+	}
+
+	// If the "uplinks" attribute is updated to add or remove uplink entries,
+	// we have to call the "updateDVSConfiguration" function twice, once to update
+	// the uplinks and once to update all the hosts's devices
+	//
+	// If we don't seperate the calls, vmware throws an error indicating a resource
+	// is in use when you remove an uplink and will throw error that the host is
+	// configured with a wrong nic when adding an uplink
+	if expandCfg.IsUplinksRemoved || expandCfg.IsUplinksAdded {
+		// This is a hack around the fact that the "updateDVSConfiguration" function
+		// does not fully complete the distributed switch configuration
+		//
+		// In theory the "updateDVSConfiguration" function waits for the configuration
+		// to finish before proceeding but if we try to call the "updateDVSConfiguration"
+		// function again right after, it throws an error so we have to continuously loop
+		// through each host to verify that the removed nic cards are no longer connected
+		if expandCfg.IsUplinksRemoved {
+			currentHosts := d.Get("host").(*schema.Set).List()
+
+			for _, h := range currentHosts {
+				hostMap := h.(map[string]interface{})
+				var tfID string
+
+				if hostMap["host_system_id"] != "" {
+					tfID = hostMap["host_system_id"].(string)
+				} else {
+					tfID = hostMap["hostname"].(string)
+				}
+
+				host, _, err := hostsystem.CheckIfHostnameOrID(client, tfID)
+				if err != nil {
+					return fmt.Errorf("error retrieving host on uplink removal: %s", err)
+				}
+
+				hsProps, err := hostsystem.Properties(host)
+				if err != nil {
+					return fmt.Errorf("error retrieving host properties on uplink removal: %s", err)
+				}
+
+				hns := object.NewHostNetworkSystem(client.Client, *hsProps.ConfigManager.NetworkSystem)
+
+				// The overall process below is:
+				// 1. Loop through each dvswitch the current host is connected to and match to the
+				// one we are currently updating
+				// 2. Loop through all the physical switches that are connected to the dvswitch from host
+				// and compare against the removed uplink list
+				// 3. If any of the removed unlink entries are found within the current host's nic list, continue
+				// looping until they are no longer there
+				for {
+					var moHns mo.HostNetworkSystem
+
+					if err = hns.Properties(context.Background(), hns.Reference(), nil, &moHns); err != nil {
+						return fmt.Errorf("error retrieving host network properties on uplink removal: %s", err)
+					}
+
+					found := false
+
+					for _, s := range moHns.NetworkConfig.ProxySwitch {
+						backing := s.Spec.Backing.(*types.DistributedVirtualSwitchHostMemberPnicBacking)
+
+						for _, removedUplink := range removedUplinks {
+							for _, nic := range backing.PnicSpec {
+								if removedUplink == nic.PnicDevice {
+									found = true
+								}
+							}
+						}
+					}
+
+					if !found {
+						break
+					}
+
+					time.Sleep(time.Second * 5)
+				}
+			}
+		}
+
+		if expandCfg.IsUplinksAdded {
+			// Looping to verify that the uplinks have been fully added to dvswitch so that hosts
+			// can connect without erroring out
+			for {
+				dvsProps, err := dvsProperties(dvs)
+				if err != nil {
+					return fmt.Errorf("could not get DVS properties after uplinks added: %s", err)
+				}
+
+				if len(dvsProps.Config.GetDVSConfigInfo().UplinkPortPolicy.(*types.DVSNameArrayUplinkPortPolicy).UplinkPortName) == len(d.Get("uplinks").([]interface{})) {
+					break
+				}
+
+				time.Sleep(time.Second * 1)
+			}
+		}
+
+		if spec, err = expandVMwareDVSConfigSpec(d, client, dvs, dvswitchExpandConfig{
+			IsUplinksRemoved: false,
+			IsUplinksAdded:   false,
+		}); err != nil {
+			return fmt.Errorf("error retrieving config: %s", err)
+		}
+		if err = updateDVSConfiguration(dvs, spec); err != nil {
+			return fmt.Errorf("could not update DVS on second update: %s", err)
+		}
 	}
 
 	// Modify network I/O control if necessary
